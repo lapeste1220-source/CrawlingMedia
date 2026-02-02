@@ -7,11 +7,13 @@ import requests
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import streamlit.components.v1 as components
 
 # -------------------------
 # 설정
 # -------------------------
 NAVER_NEWS_URL = "https://openapi.naver.com/v1/search/news.json"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 st.set_page_config(page_title="언어와 매체: 기사 분석 도구", layout="wide")
 st.title("📰 언어와 매체 수행평가: 기사 수집 · 분석 (Naver News API)")
@@ -26,8 +28,6 @@ def normalize_keywords(raw: str) -> list[str]:
         k = p.strip()
         if len(k) >= 2:
             cleaned.append(k)
-
-    # 중복 제거(순서 유지)
     seen = set()
     out = []
     for k in cleaned:
@@ -36,13 +36,10 @@ def normalize_keywords(raw: str) -> list[str]:
             seen.add(k)
     return out
 
-
 def clean_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "")
 
-
 def safe_text(s: str) -> str:
-    """HTML에 넣어도 깨지지 않게 최소한의 escape"""
     if s is None:
         return ""
     return (
@@ -52,17 +49,11 @@ def safe_text(s: str) -> str:
         .replace(">", "&gt;")
     )
 
-
 def parse_pubdate_to_dt(pub_raw: str):
-    """
-    네이버 pubDate 예: 'Mon, 02 Feb 2026 11:04:00 +0900'
-    datetime.strptime로 처리
-    """
     try:
         return datetime.strptime(pub_raw, "%a, %d %b %Y %H:%M:%S %z")
     except Exception:
         return None
-
 
 def naver_api_headers():
     try:
@@ -71,12 +62,12 @@ def naver_api_headers():
     except Exception:
         st.error("Secrets에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 이 없습니다.")
         st.stop()
+    return {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec}
 
-    return {
-        "X-Naver-Client-Id": cid,
-        "X-Naver-Client-Secret": csec,
-    }
-
+def get_gemini_key_and_model():
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+    model = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+    return api_key, model
 
 def dedup_articles(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -87,29 +78,19 @@ def dedup_articles(df: pd.DataFrame) -> pd.DataFrame:
         df = df.drop_duplicates(subset=["title", "pubDate"])
     return df.reset_index(drop=True)
 
-
+# -------------------------
+# API 수집
+# -------------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_news_one_keyword(keyword: str, start_d: date, end_d: date, target_n: int, per_page: int = 100) -> pd.DataFrame:
-    """
-    네이버 뉴스 검색 API로 기사 목록 수집.
-    - display 최대 100 (per_page)
-    - start 1부터 페이지네이션
-    - 기간은 pubDate를 파싱해서 앱에서 필터링
-    """
     headers = naver_api_headers()
     rows = []
-
     start = 1
     safety_pages = 0
     max_start = 1000  # 안전장치
 
     while True:
-        params = {
-            "query": keyword,
-            "display": per_page,
-            "start": start,
-            "sort": "date",
-        }
+        params = {"query": keyword, "display": per_page, "start": start, "sort": "date"}
         r = requests.get(NAVER_NEWS_URL, headers=headers, params=params, timeout=20)
         if r.status_code != 200:
             raise RuntimeError(f"네이버 API 오류: {r.status_code} / {r.text}")
@@ -120,12 +101,10 @@ def fetch_news_one_keyword(keyword: str, start_d: date, end_d: date, target_n: i
             break
 
         for it in items:
-            pub_raw = it.get("pubDate", "")
-            pub_dt = parse_pubdate_to_dt(pub_raw)
+            pub_dt = parse_pubdate_to_dt(it.get("pubDate", ""))
             if pub_dt is None:
                 continue
 
-            # 기간 필터(로컬 날짜 기준)
             pub_local_date = pub_dt.astimezone().date()
             if not (start_d <= pub_local_date <= end_d):
                 continue
@@ -144,24 +123,62 @@ def fetch_news_one_keyword(keyword: str, start_d: date, end_d: date, target_n: i
 
         start += per_page
         safety_pages += 1
-        if start > max_start:
+        if start > max_start or safety_pages >= 12:
             break
-        if safety_pages >= 12:  # 무한루프 방지
-            break
-
         time.sleep(0.2)
 
     return pd.DataFrame(rows)
 
+# -------------------------
+# Gemini 분석 (대시보드 해석)
+# -------------------------
+def gemini_analyze_dashboard(stats_text: str) -> str:
+    api_key, model = get_gemini_key_and_model()
+    if not api_key:
+        return "GEMINI_API_KEY가 설정되지 않았습니다. (Streamlit Cloud Secrets에 추가하세요.)"
 
-def build_report_html(df: pd.DataFrame, evidence: dict, start_d: date, end_d: date) -> str:
-    """
-    보고서 HTML 생성 (안전하게 문자열 합치기 방식)
-    """
-    # 근거 2문장 있는 것만
+    url = f"{GEMINI_BASE}/{model}:generateContent?key={api_key}"  # generateContent 엔드포인트 :contentReference[oaicite:3]{index=3}
+    prompt = f"""
+너는 고3 ‘언어와 매체’ 수행평가 조교다.
+아래 <통계 요약>에 있는 숫자/사실만 사용해 분석해라. 통계에 없는 내용(추정, 일반론, 외부지식)은 금지.
+형식:
+1) 핵심 관찰 3~5개(각 문장에 반드시 숫자 포함)
+2) 가능한 해석(프레임 관점) 2~3개: '책임귀인/갈등/경제/해결/공포/데이터' 중 어떤 프레임이 드러나는지 통계 근거와 연결
+3) 추가 탐구 질문 3개(학생이 기사 본문을 직접 확인해야 답할 수 있는 질문)
+
+<통계 요약>
+{stats_text}
+""".strip()
+
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 600
+        }
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        if resp.status_code != 200:
+            return f"Gemini 호출 오류: {resp.status_code} / {resp.text}"
+        data = resp.json()
+        # 응답에서 텍스트 추출
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return "Gemini 응답이 비어 있습니다."
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join([p.get("text", "") for p in parts])
+        return text.strip() if text.strip() else "Gemini 응답 텍스트가 비어 있습니다."
+    except Exception as e:
+        return f"Gemini 호출 예외: {e}"
+
+# -------------------------
+# 보고서 HTML 생성
+# -------------------------
+def build_report_html(df: pd.DataFrame, evidence: dict, start_d: date, end_d: date, student_id: str, student_name: str, reflection: str) -> str:
     valid_items = [(k, v) for k, v in evidence.items() if v.get("e1") and v.get("e2")]
 
-    # 표 rows
     trs = []
     for idx, v in valid_items:
         frames = ", ".join(v.get("frame", []))
@@ -182,34 +199,36 @@ def build_report_html(df: pd.DataFrame, evidence: dict, start_d: date, end_d: da
 
     rows_html = "\n".join(trs)
 
-    # 페이지 메타
     created = datetime.now().strftime("%Y-%m-%d %H:%M")
     kws = ", ".join(sorted(set(df["keyword"].tolist()))) if not df.empty else ""
     n_articles = len(df)
 
-    # CSS의 중괄호 때문에 f-string을 쓰지 않고 단순 문자열로 조립
     html = (
         "<!doctype html>"
         "<html><head><meta charset='utf-8'/>"
         "<title>언어와 매체 수행평가 보고서</title>"
         "<style>"
-        "body{font-family:Arial, sans-serif; line-height:1.4; padding:18px;}"
+        "body{font-family:Arial, sans-serif; line-height:1.5; padding:18px;}"
         "table{border-collapse:collapse; width:100%;}"
         "th,td{border:1px solid #ccc; padding:8px; vertical-align:top;}"
         "th{background:#f2f2f2;}"
         "h1{margin-bottom:6px;}"
         ".meta{color:#555; margin:8px 0 16px 0;}"
+        ".box{border:1px solid #ddd; padding:12px; background:#fafafa;}"
         ".note{margin-top:14px; color:#333;}"
         "</style>"
         "</head><body>"
         "<h1>언어와 매체 수행평가 보고서</h1>"
         f"<div class='meta'>"
+        f"<b>학번</b>: {safe_text(student_id)} &nbsp;&nbsp; <b>성명</b>: {safe_text(student_name)}<br/>"
         f"생성 시각: {created}<br/>"
         f"입력 키워드: {safe_text(kws)}<br/>"
         f"기사 수집 기간: {start_d} ~ {end_d}<br/>"
         f"수집 기사 수: {n_articles}"
         f"</div>"
-        "<h2>Claim–Evidence–Source 표</h2>"
+        "<h2>개인 생각(소감/비판적 관점)</h2>"
+        f"<div class='box'>{safe_text(reflection).replace('\\n','<br/>')}</div>"
+        "<h2 style='margin-top:18px;'>Claim–Evidence–Source 표</h2>"
         "<p>※ 각 항목은 학생이 입력한 ‘근거 문장’을 기반으로 구성됩니다.</p>"
         "<table>"
         "<thead><tr>"
@@ -224,7 +243,6 @@ def build_report_html(df: pd.DataFrame, evidence: dict, start_d: date, end_d: da
         "</body></html>"
     )
     return html
-
 
 # -------------------------
 # 사이드바 입력
@@ -248,9 +266,8 @@ with st.sidebar:
 
     run = st.button("수집 시작", type="primary")
 
-
 # -------------------------
-# 실행
+# 수집 실행
 # -------------------------
 if run:
     keywords = normalize_keywords(raw_keywords)
@@ -279,7 +296,6 @@ if run:
 
     df = dedup_articles(df)
 
-    # 부족하면 첫 키워드로 추가 수집해서 채우기
     if len(df) < target_total:
         st.warning(f"현재 {len(df)}개만 수집됨 → 추가 수집 시도")
         remain = target_total - len(df)
@@ -288,139 +304,24 @@ if run:
         df = dedup_articles(df)
 
     st.success(f"최종 수집: {len(df)}개 (목표 {target_total})")
-    # ✅ rerun돼도 데이터 유지(핵심)
+
+    # ✅ rerun돼도 유지
     st.session_state["df"] = df
     st.session_state["start_d"] = start_d
     st.session_state["end_d"] = end_d
     st.session_state["data_ready"] = True
 
-    
-    # -------------------------
-    # 탭 UI (①~④)
-    # -------------------------
-    tabs = st.tabs(["① 기사 목록", "② 통계 대시보드", "③ 근거 입력", "④ 보고서"])
-
-    with tabs[0]:
-        st.subheader("① 기사 목록")
-        st.dataframe(df[["pubDate", "keyword", "title", "link"]], use_container_width=True)
-        st.download_button(
-            "CSV 다운로드(기사 목록)",
-            data=df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="articles.csv",
-            mime="text/csv",
-        )
-
-    with tabs[1]:
-        st.subheader("② 통계 대시보드")
-
-        df["date"] = df["pubDate"].str.slice(0, 10)
-
-        by_date = df.groupby("date")["title"].count().reset_index(name="count")
-        fig1 = px.line(by_date, x="date", y="count", markers=True, title="날짜별 기사량")
-        st.plotly_chart(fig1, use_container_width=True)
-
-        by_kw = (
-            df.groupby("keyword")["title"]
-            .count()
-            .reset_index(name="count")
-            .sort_values("count", ascending=False)
-        )
-        fig2 = px.bar(by_kw, x="keyword", y="count", title="키워드별 기사량")
-        st.plotly_chart(fig2, use_container_width=True)
-
-        st.subheader("③ 제목 강조어 빈도(간단)")
-        hype_words = ["충격", "논란", "파장", "긴급", "폭로", "충돌", "경악", "비상", "전격"]
-        hype_df = pd.DataFrame({
-            "word": hype_words,
-            "count": [int(df["title"].str.contains(w).sum()) for w in hype_words]
-        }).sort_values("count", ascending=False)
-
-        fig3 = px.bar(hype_df, x="word", y="count", title="강조/선정 표현 빈도(제목 기준)")
-        st.plotly_chart(fig3, use_container_width=True)
-
-    with tabs[2]:
-        st.subheader("③ 근거 입력")
-        st.write("기사별로 **근거 문장 2개** + **프레임**을 입력하고 저장하세요. (이게 있어야 보고서 생성 가능)")
-
-        if "evidence" not in st.session_state:
-            st.session_state.evidence = {}
-
-        idx = st.number_input("기사 번호 선택(0부터)", min_value=0, max_value=len(df)-1, value=0, step=1)
-        row = df.iloc[int(idx)]
-
-        st.markdown(f"**제목:** {row['title']}")
-        st.markdown(f"**키워드:** {row.get('keyword','')}")
-        st.markdown(f"**날짜:** {row.get('pubDate','')}")
-        st.markdown(f"**링크:** {row.get('link','')}")
-
-        saved = st.session_state.evidence.get(int(idx), {})
-        e1 = st.text_area("근거 문장 1(기사에서 그대로 복사)", value=saved.get("e1", ""), height=80)
-        e2 = st.text_area("근거 문장 2(기사에서 그대로 복사)", value=saved.get("e2", ""), height=80)
-
-        frame = st.multiselect(
-            "프레임(복수 선택 가능)",
-            ["갈등/대립", "책임 귀인", "경제/비용", "도덕/가치", "공포/위험", "해결/정책", "인물 중심", "데이터/연구 중심"],
-            default=saved.get("frame", [])
-        )
-
-        levels = ["데이터/보고서 명시", "실명 전문가/기관 인용", "당사자 인터뷰", "익명 관계자", "추정/가능성 표현 위주"]
-        level_saved = saved.get("level", levels[0])
-        level_index = levels.index(level_saved) if level_saved in levels else 0
-
-        evidence_level = st.selectbox("근거 수준", levels, index=level_index)
-
-        if st.button("이 기사 입력 저장", type="primary"):
-            st.session_state.evidence[int(idx)] = {
-                "e1": e1.strip(),
-                "e2": e2.strip(),
-                "frame": frame,
-                "level": evidence_level,
-                "title": row.get("title", ""),
-                "link": row.get("link", ""),
-                "pubDate": row.get("pubDate", ""),
-                "keyword": row.get("keyword", ""),
-            }
-            st.success("저장 완료!")
-
-        st.divider()
-        ev = st.session_state.evidence
-        valid = [k for k, v in ev.items() if v.get("e1") and v.get("e2")]
-        st.info(f"근거 2문장 입력 완료: {len(valid)}개 기사")
-
-    with tabs[3]:
-        st.subheader("④ 보고서")
-
-        ev = st.session_state.get("evidence", {})
-        valid_items = [(k, v) for k, v in ev.items() if v.get("e1") and v.get("e2")]
-
-        min_required = 3
-        st.write(f"근거 입력 완료 기사 수: **{len(valid_items)}개** / 필요: **{min_required}개**")
-
-        if len(valid_items) < min_required:
-            st.warning("③ 근거 입력에서 최소 3개 기사에 근거 문장 2개를 입력하고 저장하세요.")
-            st.stop()
-
-        html = build_report_html(df, ev, start_d, end_d)
-
-        st.download_button(
-            "HTML 보고서 다운로드",
-            data=html.encode("utf-8"),
-            file_name="report.html",
-            mime="text/html",
-        )
-        st.info("PDF는 report.html을 열고 브라우저 인쇄(Ctrl+P) → ‘PDF로 저장’이 가장 안정적입니다.")
-# ✅ 수집 버튼을 누르지 않아도, session_state에 df가 있으면 계속 보여주기
+# -------------------------
+# 메인 표시(세션에 데이터 있으면 계속 유지)
+# -------------------------
 if st.session_state.get("data_ready") and "df" in st.session_state:
     df = st.session_state["df"]
     start_d = st.session_state["start_d"]
     end_d = st.session_state["end_d"]
 
-    # -------------------------
-    # 탭 UI (①~④)  ← 기존 탭 코드 통째로 여기로 옮겨도 되고,
-    # 이미 if run 안에 있다면 "그 부분을 잘라서" 여기로 붙여넣으면 가장 깔끔합니다.
-    # -------------------------
     tabs = st.tabs(["① 기사 목록", "② 통계 대시보드", "③ 근거 입력", "④ 보고서"])
 
+    # ① 기사 목록
     with tabs[0]:
         st.subheader("① 기사 목록")
         st.dataframe(df[["pubDate", "keyword", "title", "link"]], use_container_width=True)
@@ -431,17 +332,57 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
             mime="text/csv",
         )
 
+    # ② 통계 + Gemini 해석
     with tabs[1]:
         st.subheader("② 통계 대시보드")
-        df["date"] = df["pubDate"].str.slice(0, 10)
-        by_date = df.groupby("date")["title"].count().reset_index(name="count")
+
+        df_local = df.copy()
+        df_local["date"] = df_local["pubDate"].str.slice(0, 10)
+
+        by_date = df_local.groupby("date")["title"].count().reset_index(name="count")
         st.plotly_chart(px.line(by_date, x="date", y="count", markers=True, title="날짜별 기사량"), use_container_width=True)
 
-        by_kw = df.groupby("keyword")["title"].count().reset_index(name="count").sort_values("count", ascending=False)
+        by_kw = df_local.groupby("keyword")["title"].count().reset_index(name="count").sort_values("count", ascending=False)
         st.plotly_chart(px.bar(by_kw, x="keyword", y="count", title="키워드별 기사량"), use_container_width=True)
 
+        st.subheader("③ 제목 강조어 빈도(간단)")
+        hype_words = ["충격", "논란", "파장", "긴급", "폭로", "충돌", "경악", "비상", "전격"]
+        hype_df = pd.DataFrame({
+            "word": hype_words,
+            "count": [int(df_local["title"].str.contains(w).sum()) for w in hype_words]
+        }).sort_values("count", ascending=False)
+        st.plotly_chart(px.bar(hype_df, x="word", y="count", title="강조/선정 표현 빈도(제목 기준)"), use_container_width=True)
+
+        st.divider()
+        st.subheader("④ (업그레이드) Gemini로 통계 해석 생성")
+
+        # 통계 요약 텍스트 만들기(모델에 “이것만” 주기)
+        top_kw = by_kw.head(10).to_dict("records")
+        peak = by_date.sort_values("count", ascending=False).head(1).to_dict("records")
+        hype_top = hype_df.head(6).to_dict("records")
+        stats_text = (
+            f"- 기간: {start_d} ~ {end_d}\n"
+            f"- 수집 기사 수: {len(df_local)}\n"
+            f"- 키워드별 기사량(상위): {top_kw}\n"
+            f"- 날짜별 기사량(피크): {peak}\n"
+            f"- 제목 강조어 빈도(상위): {hype_top}\n"
+        )
+
+        with st.expander("Gemini에게 전달되는 통계 요약(검증용)"):
+            st.code(stats_text)
+
+        if st.button("Gemini로 통계 해석 생성", type="primary"):
+            with st.spinner("Gemini가 통계 해석을 작성 중..."):
+                result = gemini_analyze_dashboard(stats_text)
+                st.session_state["gemini_dashboard_commentary"] = result
+
+        if "gemini_dashboard_commentary" in st.session_state:
+            st.markdown(st.session_state["gemini_dashboard_commentary"])
+
+    # ③ 근거 입력
     with tabs[2]:
         st.subheader("③ 근거 입력")
+        st.write("기사별로 **근거 문장 2개** + **프레임**을 입력하고 저장하세요. (이게 있어야 보고서 생성 가능)")
 
         if "evidence" not in st.session_state:
             st.session_state.evidence = {}
@@ -485,25 +426,73 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
         valid = [k for k, v in st.session_state.evidence.items() if v.get("e1") and v.get("e2")]
         st.info(f"근거 2문장 입력 완료: {len(valid)}개 기사")
 
+    # ④ 보고서: 미리보기 + 학번/성명 + 개인생각 + 다운로드 조건
     with tabs[3]:
         st.subheader("④ 보고서")
+
+        # 입력란(세션 저장)
+        if "student_id" not in st.session_state:
+            st.session_state["student_id"] = ""
+        if "student_name" not in st.session_state:
+            st.session_state["student_name"] = ""
+        if "reflection" not in st.session_state:
+            st.session_state["reflection"] = ""
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state["student_id"] = st.text_input("학번", value=st.session_state["student_id"])
+        with col2:
+            st.session_state["student_name"] = st.text_input("성명", value=st.session_state["student_name"])
+
+        st.session_state["reflection"] = st.text_area(
+            "개인 생각(소감/비판적 관점) — 통계+근거문장에 기반해 작성",
+            value=st.session_state["reflection"],
+            height=160
+        )
+
         ev = st.session_state.get("evidence", {})
         valid_items = [(k, v) for k, v in ev.items() if v.get("e1") and v.get("e2")]
 
         min_required = 3
         st.write(f"근거 입력 완료 기사 수: **{len(valid_items)}개** / 필요: **{min_required}개**")
 
-        if len(valid_items) < min_required:
+        # 다운로드 가능 조건
+        ok_evidence = len(valid_items) >= min_required
+        ok_student = bool(st.session_state["student_id"].strip()) and bool(st.session_state["student_name"].strip())
+        ok_reflection = bool(st.session_state["reflection"].strip())
+
+        if not ok_student:
+            st.warning("학번/성명을 입력하세요.")
+        if not ok_reflection:
+            st.warning("개인 생각(소감)을 입력하세요.")
+        if not ok_evidence:
             st.warning("③ 근거 입력에서 최소 3개 기사에 근거 문장 2개를 입력하고 저장하세요.")
-        else:
-            html = build_report_html(df, ev, start_d, end_d)
+
+        can_make = ok_student and ok_reflection and ok_evidence
+
+        # 미리보기 생성
+        if can_make:
+            html = build_report_html(
+                df=df,
+                evidence=ev,
+                start_d=start_d,
+                end_d=end_d,
+                student_id=st.session_state["student_id"],
+                student_name=st.session_state["student_name"],
+                reflection=st.session_state["reflection"]
+            )
+
+            st.subheader("보고서 미리보기")
+            components.html(html, height=520, scrolling=True)
+
             st.download_button(
-                "HTML 보고서 다운로드",
+                "HTML 보고서 다운로드(조건 충족)",
                 data=html.encode("utf-8"),
                 file_name="report.html",
                 mime="text/html",
             )
             st.info("PDF는 report.html을 열고 브라우저 인쇄(Ctrl+P) → ‘PDF로 저장’이 가장 안정적입니다.")
+        else:
+            st.info("위 조건을 모두 채우면 ‘미리보기’와 ‘다운로드’가 활성화됩니다.")
 else:
     st.caption("왼쪽에서 기간/키워드 입력 → ‘수집 시작’을 누르세요.")
-
