@@ -159,7 +159,39 @@ def gemini_analyze_dashboard(stats_text: str) -> str:
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=30)
+        # ✅ 타임아웃/재시도 강화
+last_err = None
+for _ in range(2):  # 2회 재시도
+    try:
+        resp = requests.post(url, json=payload, timeout=90)
+        if resp.status_code == 200:
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return "Gemini 응답이 비어 있습니다."
+
+            # finishReason 확인(있으면)
+            fr = candidates[0].get("finishReason", "")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text = "".join([p.get("text", "") for p in parts]).strip()
+
+            if not text:
+                return f"Gemini 텍스트가 비어 있습니다. (finishReason={fr})"
+
+            # 너무 짧으면 경고 붙이기(중간 잘림 감지용)
+            if len(text) < 80:
+                text += "\n\n⚠️ (응답이 매우 짧습니다. 키/쿼터/안전필터/타임아웃 가능성이 있어요.)"
+
+            return text
+        else:
+            last_err = f"Gemini 호출 오류: {resp.status_code} / {resp.text}"
+            time.sleep(1)
+    except Exception as e:
+        last_err = f"Gemini 호출 예외: {e}"
+        time.sleep(1)
+
+return last_err or "Gemini 호출 실패"
+
         if resp.status_code != 200:
             return f"Gemini 호출 오류: {resp.status_code} / {resp.text}"
         data = resp.json()
@@ -377,7 +409,12 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
                 st.session_state["gemini_dashboard_commentary"] = result
 
         if "gemini_dashboard_commentary" in st.session_state:
-            st.markdown(st.session_state["gemini_dashboard_commentary"])
+        st.text_area(
+            "Gemini 해석 결과(전체)",
+            value=st.session_state["gemini_dashboard_commentary"],
+            height=420
+        )
+        st.caption("※ 버튼 클릭 후 반응이 없으면, 잠시 아래로 스크롤해서 오류 문구가 있는지 확인하세요.")
 
     # ③ 근거 입력
     with tabs[2]:
