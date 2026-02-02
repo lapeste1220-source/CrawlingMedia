@@ -390,17 +390,26 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
         with st.expander("Gemini에게 전달되는 통계 요약(검증용)"):
             st.code(stats_text)
 
-        if st.button("Gemini로 통계 해석 생성", type="primary"):
-            with st.spinner("Gemini가 통계 해석을 작성 중..."):
+    if st.button("Gemini로 통계 해석 생성", type="primary"):
+        st.session_state["gemini_dashboard_commentary"] = ""
+        st.session_state["gemini_error"] = ""
+
+        with st.spinner("Gemini가 통계 해석을 작성 중..."):
+            try:
                 result = gemini_analyze_dashboard(stats_text)
                 st.session_state["gemini_dashboard_commentary"] = result
+            except Exception as e:
+                st.session_state["gemini_error"] = f"Gemini 분석 중 예외: {repr(e)}"
 
-        if "gemini_dashboard_commentary" in st.session_state:
-            st.text_area(
-            "Gemini 해석 결과(전체)",
-            value=st.session_state["gemini_dashboard_commentary"],
-            height=420
-        )
+    # ✅ 에러가 있으면 먼저 보여주기(원인 파악)
+    if st.session_state.get("gemini_error"):
+        st.error(st.session_state["gemini_error"])
+
+    # ✅ 결과 표시
+    commentary = st.session_state.get("gemini_dashboard_commentary", "")
+    if commentary:
+        st.text_area("Gemini 해석 결과(전체)", value=commentary, height=420)
+
         st.caption("※ 버튼 클릭 후 반응이 없으면, 잠시 아래로 스크롤해서 오류 문구가 있는지 확인하세요.")
 
     # ③ 근거 입력
