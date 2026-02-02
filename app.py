@@ -288,7 +288,13 @@ if run:
         df = dedup_articles(df)
 
     st.success(f"최종 수집: {len(df)}개 (목표 {target_total})")
+    # ✅ rerun돼도 데이터 유지(핵심)
+    st.session_state["df"] = df
+    st.session_state["start_d"] = start_d
+    st.session_state["end_d"] = end_d
+    st.session_state["data_ready"] = True
 
+    
     # -------------------------
     # 탭 UI (①~④)
     # -------------------------
@@ -403,5 +409,101 @@ if run:
             mime="text/html",
         )
         st.info("PDF는 report.html을 열고 브라우저 인쇄(Ctrl+P) → ‘PDF로 저장’이 가장 안정적입니다.")
+# ✅ 수집 버튼을 누르지 않아도, session_state에 df가 있으면 계속 보여주기
+if st.session_state.get("data_ready") and "df" in st.session_state:
+    df = st.session_state["df"]
+    start_d = st.session_state["start_d"]
+    end_d = st.session_state["end_d"]
+
+    # -------------------------
+    # 탭 UI (①~④)  ← 기존 탭 코드 통째로 여기로 옮겨도 되고,
+    # 이미 if run 안에 있다면 "그 부분을 잘라서" 여기로 붙여넣으면 가장 깔끔합니다.
+    # -------------------------
+    tabs = st.tabs(["① 기사 목록", "② 통계 대시보드", "③ 근거 입력", "④ 보고서"])
+
+    with tabs[0]:
+        st.subheader("① 기사 목록")
+        st.dataframe(df[["pubDate", "keyword", "title", "link"]], use_container_width=True)
+        st.download_button(
+            "CSV 다운로드(기사 목록)",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="articles.csv",
+            mime="text/csv",
+        )
+
+    with tabs[1]:
+        st.subheader("② 통계 대시보드")
+        df["date"] = df["pubDate"].str.slice(0, 10)
+        by_date = df.groupby("date")["title"].count().reset_index(name="count")
+        st.plotly_chart(px.line(by_date, x="date", y="count", markers=True, title="날짜별 기사량"), use_container_width=True)
+
+        by_kw = df.groupby("keyword")["title"].count().reset_index(name="count").sort_values("count", ascending=False)
+        st.plotly_chart(px.bar(by_kw, x="keyword", y="count", title="키워드별 기사량"), use_container_width=True)
+
+    with tabs[2]:
+        st.subheader("③ 근거 입력")
+
+        if "evidence" not in st.session_state:
+            st.session_state.evidence = {}
+
+        idx = st.number_input("기사 번호 선택(0부터)", min_value=0, max_value=len(df)-1, value=0, step=1)
+        row = df.iloc[int(idx)]
+
+        st.markdown(f"**제목:** {row['title']}")
+        st.markdown(f"**키워드:** {row.get('keyword','')}")
+        st.markdown(f"**날짜:** {row.get('pubDate','')}")
+        st.markdown(f"**링크:** {row.get('link','')}")
+
+        saved = st.session_state.evidence.get(int(idx), {})
+        e1 = st.text_area("근거 문장 1(기사에서 그대로 복사)", value=saved.get("e1", ""), height=80)
+        e2 = st.text_area("근거 문장 2(기사에서 그대로 복사)", value=saved.get("e2", ""), height=80)
+
+        frame = st.multiselect(
+            "프레임(복수 선택 가능)",
+            ["갈등/대립", "책임 귀인", "경제/비용", "도덕/가치", "공포/위험", "해결/정책", "인물 중심", "데이터/연구 중심"],
+            default=saved.get("frame", [])
+        )
+
+        levels = ["데이터/보고서 명시", "실명 전문가/기관 인용", "당사자 인터뷰", "익명 관계자", "추정/가능성 표현 위주"]
+        level_saved = saved.get("level", levels[0])
+        level_index = levels.index(level_saved) if level_saved in levels else 0
+        evidence_level = st.selectbox("근거 수준", levels, index=level_index)
+
+        if st.button("이 기사 입력 저장", type="primary"):
+            st.session_state.evidence[int(idx)] = {
+                "e1": e1.strip(),
+                "e2": e2.strip(),
+                "frame": frame,
+                "level": evidence_level,
+                "title": row.get("title", ""),
+                "link": row.get("link", ""),
+                "pubDate": row.get("pubDate", ""),
+                "keyword": row.get("keyword", ""),
+            }
+            st.success("저장 완료!")
+
+        valid = [k for k, v in st.session_state.evidence.items() if v.get("e1") and v.get("e2")]
+        st.info(f"근거 2문장 입력 완료: {len(valid)}개 기사")
+
+    with tabs[3]:
+        st.subheader("④ 보고서")
+        ev = st.session_state.get("evidence", {})
+        valid_items = [(k, v) for k, v in ev.items() if v.get("e1") and v.get("e2")]
+
+        min_required = 3
+        st.write(f"근거 입력 완료 기사 수: **{len(valid_items)}개** / 필요: **{min_required}개**")
+
+        if len(valid_items) < min_required:
+            st.warning("③ 근거 입력에서 최소 3개 기사에 근거 문장 2개를 입력하고 저장하세요.")
+        else:
+            html = build_report_html(df, ev, start_d, end_d)
+            st.download_button(
+                "HTML 보고서 다운로드",
+                data=html.encode("utf-8"),
+                file_name="report.html",
+                mime="text/html",
+            )
+            st.info("PDF는 report.html을 열고 브라우저 인쇄(Ctrl+P) → ‘PDF로 저장’이 가장 안정적입니다.")
 else:
     st.caption("왼쪽에서 기간/키워드 입력 → ‘수집 시작’을 누르세요.")
+
