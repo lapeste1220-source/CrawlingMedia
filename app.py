@@ -199,9 +199,12 @@ if run:
 
     st.success(f"최종 수집: {len(df)}개 (목표 {target_total})")
 
-    # -------------------------
-    # 5) 화면: 기사 목록
-    # -------------------------
+# -------------------------
+# 5) 탭 UI (①~④)
+# -------------------------
+tabs = st.tabs(["① 기사 목록", "② 통계 대시보드", "③ 근거 입력", "④ 보고서"])
+
+with tabs[0]:
     st.subheader("① 기사 목록")
     st.dataframe(df[["pubDate", "keyword", "title", "link"]], use_container_width=True)
 
@@ -212,9 +215,7 @@ if run:
         mime="text/csv",
     )
 
-    # -------------------------
-    # 6) 화면: 기본 통계 대시보드
-    # -------------------------
+with tabs[1]:
     st.subheader("② 통계 대시보드")
 
     # 날짜별 기사량
@@ -238,6 +239,123 @@ if run:
     fig3 = px.bar(hype_df, x="word", y="count", title="강조/선정 표현 빈도(제목 기준)")
     st.plotly_chart(fig3, use_container_width=True)
 
-    st.info("다음 단계: 기사별 ‘근거 문장 2개 + 프레임 체크’ 입력 화면과, HTML 보고서 생성(→PDF 저장)을 붙입니다.")
-else:
-    st.caption("왼쪽에서 기간/키워드를 넣고 ‘수집 시작’을 누르세요.")
+with tabs[2]:
+    st.subheader("③ 근거 입력")
+    st.write("기사별로 **근거 문장 2개** + **프레임**을 입력하세요. (이게 있어야 보고서가 열립니다)")
+
+    # 세션 저장소 준비
+    if "evidence" not in st.session_state:
+        st.session_state.evidence = {}
+
+    # 기사 선택
+    idx = st.number_input("기사 번호 선택(0부터)", min_value=0, max_value=len(df)-1, value=0, step=1)
+    row = df.iloc[int(idx)]
+
+    st.markdown(f"**제목:** {row['title']}")
+    st.markdown(f"**키워드:** {row.get('keyword','')}")
+    st.markdown(f"**날짜:** {row.get('pubDate','')}")
+    st.markdown(f"**링크:** {row.get('link','')}")
+
+    # 기존 저장값 불러오기(있으면)
+    saved = st.session_state.evidence.get(int(idx), {})
+    e1_default = saved.get("e1", "")
+    e2_default = saved.get("e2", "")
+    frame_default = saved.get("frame", [])
+    level_default = saved.get("level", "데이터/보고서 명시")
+
+    e1 = st.text_area("근거 문장 1(기사에서 그대로 복사)", value=e1_default, height=80)
+    e2 = st.text_area("근거 문장 2(기사에서 그대로 복사)", value=e2_default, height=80)
+
+    frame = st.multiselect(
+        "프레임(복수 선택 가능)",
+        ["갈등/대립", "책임 귀인", "경제/비용", "도덕/가치", "공포/위험", "해결/정책", "인물 중심", "데이터/연구 중심"],
+        default=frame_default
+    )
+
+    evidence_level = st.selectbox(
+        "근거 수준",
+        ["데이터/보고서 명시", "실명 전문가/기관 인용", "당사자 인터뷰", "익명 관계자", "추정/가능성 표현 위주"],
+        index=["데이터/보고서 명시", "실명 전문가/기관 인용", "당사자 인터뷰", "익명 관계자", "추정/가능성 표현 위주"].index(level_default)
+        if level_default in ["데이터/보고서 명시", "실명 전문가/기관 인용", "당사자 인터뷰", "익명 관계자", "추정/가능성 표현 위주"] else 0
+    )
+
+    if st.button("이 기사 입력 저장", type="primary"):
+        st.session_state.evidence[int(idx)] = {
+            "e1": e1.strip(),
+            "e2": e2.strip(),
+            "frame": frame,
+            "level": evidence_level,
+            "title": row["title"],
+            "link": row.get("link", ""),
+            "pubDate": row.get("pubDate", ""),
+            "keyword": row.get("keyword", "")
+        }
+        st.success("저장 완료!")
+
+    st.divider()
+    # 입력 현황
+    ev = st.session_state.evidence
+    valid = [k for k, v in ev.items() if v.get("e1") and v.get("e2")]
+    st.info(f"근거 2문장 입력 완료: {len(valid)}개 기사")
+
+with tabs[3]:
+    st.subheader("④ 보고서")
+    ev = st.session_state.get("evidence", {})
+    valid_items = [(k, v) for k, v in ev.items() if v.get("e1") and v.get("e2")]
+
+    min_required = 3
+    st.write(f"근거 입력 완료 기사 수: **{len(valid_items)}개** / 필요: **{min_required}개**")
+
+    if len(valid_items) < min_required:
+        st.warning("보고서 생성을 위해, ③ 근거 입력에서 최소 3개 기사에 근거 문장 2개를 입력하고 저장하세요.")
+        st.stop()
+
+    # 간단 HTML 보고서 생성
+    rows_html = ""
+    for idx, v in valid_items[:50]:  # 보고서 과다 방지(최대 50개)
+        frames = ", ".join(v.get("frame", []))
+        rows_html += f"""
+        <tr>
+          <td>{idx}</td>
+          <td>{v.get('pubDate','')}</td>
+          <td>{v.get('keyword','')}</td>
+          <td>{v.get('title','')}</td>
+          <td>{frames}</td>
+          <td>{v.get('level','')}</td>
+          <td>{v.get('e1','').replace('<','&lt;').replace('>','&gt;')}</td>
+          <td>{v.get('e2','').replace('<','&lt;').replace('>','&gt;')}</td>
+          <td><a href="{v.get('link','')}" target="_blank">link</a></td>
+        </tr>
+        """
+
+    html = f"""
+    <html>
+    <head>
+      <meta charset="utf-8"/>
+      <title>언어와 매체 수행평가 보고서</title>
+      <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.4; }}
+        table {{ border-collapse: collapse; width: 100%; }}
+        th, td {{ border: 1px solid #ccc; padding: 8px; vertical-align: top; }}
+        th {{ background: #f2f2f2; }}
+        h1 {{ margin-bottom: 0; }}
+        .meta {{ color: #555; margin-top: 4px; }}
+      </style>
+    </head>
+    <body>
+      <h1>언어와 매체 수행평가 보고서</h1>
+      <div class="meta">
+        생성 시각: {datetime.now().strftime("%Y-%m-%d %H:%M")}<br/>
+        입력 키워드: {", ".join(sorted(set(df["keyword"].tolist())))}<br/>
+        기사 수집 기간: {start_d} ~ {end_d}<br/>
+        수집 기사 수: {len(df)}
+      </div>
+      <h2>Claim–Evidence–Source 표</h2>
+      <p>※ 각 항목은 학생이 입력한 ‘근거 문장’을 기반으로 구성됩니다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>No</th>
+            <th>날짜</th>
+            <th>키워드</th>
+  
