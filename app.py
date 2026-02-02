@@ -396,7 +396,7 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
                 st.session_state["gemini_dashboard_commentary"] = result
 
         if "gemini_dashboard_commentary" in st.session_state:
-        st.text_area(
+            st.text_area(
             "Gemini 해석 결과(전체)",
             value=st.session_state["gemini_dashboard_commentary"],
             height=420
