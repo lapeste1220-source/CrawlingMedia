@@ -135,16 +135,17 @@ def fetch_news_one_keyword(keyword: str, start_d: date, end_d: date, target_n: i
 def gemini_analyze_dashboard(stats_text: str) -> str:
     api_key, model = get_gemini_key_and_model()
     if not api_key:
-        return "GEMINI_API_KEY가 설정되지 않았습니다. (Streamlit Cloud Secrets에 추가하세요.)"
+        return "GEMINI_API_KEY가 설정되지 않았습니다. (Secrets 확인)"
 
     url = f"{GEMINI_BASE}/{model}:generateContent?key={api_key}"
+
     prompt = f"""
 너는 고3 ‘언어와 매체’ 수행평가 조교다.
-아래 <통계 요약>에 있는 숫자/사실만 사용해 분석해라. 통계에 없는 내용(추정, 일반론, 외부지식)은 금지.
-형식:
-1) 핵심 관찰 3~5개(각 문장에 반드시 숫자 포함)
-2) 가능한 해석(프레임 관점) 2~3개: '책임귀인/갈등/경제/해결/공포/데이터' 중 어떤 프레임이 드러나는지 통계 근거와 연결
-3) 추가 탐구 질문 3개(학생이 기사 본문을 직접 확인해야 답할 수 있는 질문)
+아래 <통계 요약>의 숫자/사실만 사용해 분석해라. 통계에 없는 내용(추정, 일반론, 외부지식)은 금지.
+반드시 아래 형식을 지켜라:
+[1] 핵심 관찰(3~5개): 각 문장에 수치 1개 이상 포함
+[2] 프레임 해석(2~3개): 책임귀인/갈등/경제/해결/공포/데이터 중 무엇이 보이는지, 통계 수치와 연결
+[3] 추가 탐구 질문(3개): 기사 본문 확인이 필요하게
 
 <통계 요약>
 {stats_text}
@@ -154,42 +155,47 @@ def gemini_analyze_dashboard(stats_text: str) -> str:
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 600
+            "maxOutputTokens": 900
         }
     }
 
     last_err = None
-
-    for _ in range(2):  # 최대 2회 재시도
+    for _ in range(2):
         try:
             resp = requests.post(url, json=payload, timeout=90)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    return "Gemini 응답이 비어 있습니다."
-
-                parts = candidates[0].get("content", {}).get("parts", [])
-                text = "".join([p.get("text", "") for p in parts]).strip()
-
-                if not text:
-                    return "Gemini 텍스트가 비어 있습니다."
-
-                if len(text) < 80:
-                    text += "\n\n⚠️ (응답이 매우 짧습니다. 키/쿼터/타임아웃 문제 가능)"
-
-                return text
-
-            else:
-                last_err = f"Gemini 호출 오류: {resp.status_code} / {resp.text}"
+            if resp.status_code != 200:
+                last_err = f"HTTP {resp.status_code}: {resp.text}"
                 time.sleep(1)
+                continue
+
+            data = resp.json()
+
+            # 진단 정보
+            prompt_feedback = data.get("promptFeedback", {})
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return f"Gemini candidates 없음. promptFeedback={prompt_feedback}"
+
+            c0 = candidates[0]
+            finish = c0.get("finishReason", "")
+            parts = c0.get("content", {}).get("parts", [])
+            text = "".join([p.get("text", "") for p in parts]).strip()
+
+            if not text:
+                return f"Gemini 텍스트 비어있음. finishReason={finish}, promptFeedback={prompt_feedback}"
+
+            # 너무 짧으면 진단 메시지 덧붙임
+            if len(text) < 120:
+                text += f"\n\n⚠️ 응답이 짧습니다.\n- finishReason={finish}\n- promptFeedback={prompt_feedback}"
+
+            return text
 
         except Exception as e:
-            last_err = f"Gemini 호출 예외: {e}"
+            last_err = repr(e)
             time.sleep(1)
 
-    return last_err or "Gemini 호출 실패"
+    return f"Gemini 호출 실패: {last_err}"
+
 
 
 # -------------------------
