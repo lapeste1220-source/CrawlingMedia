@@ -137,7 +137,7 @@ def gemini_analyze_dashboard(stats_text: str) -> str:
     if not api_key:
         return "GEMINI_API_KEY가 설정되지 않았습니다. (Streamlit Cloud Secrets에 추가하세요.)"
 
-    url = f"{GEMINI_BASE}/{model}:generateContent?key={api_key}"  # generateContent 엔드포인트 :contentReference[oaicite:3]{index=3}
+    url = f"{GEMINI_BASE}/{model}:generateContent?key={api_key}"
     prompt = f"""
 너는 고3 ‘언어와 매체’ 수행평가 조교다.
 아래 <통계 요약>에 있는 숫자/사실만 사용해 분석해라. 통계에 없는 내용(추정, 일반론, 외부지식)은 금지.
@@ -158,52 +158,39 @@ def gemini_analyze_dashboard(stats_text: str) -> str:
         }
     }
 
-    try:
-        # ✅ 타임아웃/재시도 강화
-last_err = None
-for _ in range(2):  # 2회 재시도
-    try:
-        resp = requests.post(url, json=payload, timeout=90)
-        if resp.status_code == 200:
-            data = resp.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                return "Gemini 응답이 비어 있습니다."
+    last_err = None
 
-            # finishReason 확인(있으면)
-            fr = candidates[0].get("finishReason", "")
-            parts = candidates[0].get("content", {}).get("parts", [])
-            text = "".join([p.get("text", "") for p in parts]).strip()
+    for _ in range(2):  # 최대 2회 재시도
+        try:
+            resp = requests.post(url, json=payload, timeout=90)
 
-            if not text:
-                return f"Gemini 텍스트가 비어 있습니다. (finishReason={fr})"
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    return "Gemini 응답이 비어 있습니다."
 
-            # 너무 짧으면 경고 붙이기(중간 잘림 감지용)
-            if len(text) < 80:
-                text += "\n\n⚠️ (응답이 매우 짧습니다. 키/쿼터/안전필터/타임아웃 가능성이 있어요.)"
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join([p.get("text", "") for p in parts]).strip()
 
-            return text
-        else:
-            last_err = f"Gemini 호출 오류: {resp.status_code} / {resp.text}"
+                if not text:
+                    return "Gemini 텍스트가 비어 있습니다."
+
+                if len(text) < 80:
+                    text += "\n\n⚠️ (응답이 매우 짧습니다. 키/쿼터/타임아웃 문제 가능)"
+
+                return text
+
+            else:
+                last_err = f"Gemini 호출 오류: {resp.status_code} / {resp.text}"
+                time.sleep(1)
+
+        except Exception as e:
+            last_err = f"Gemini 호출 예외: {e}"
             time.sleep(1)
-    except Exception as e:
-        last_err = f"Gemini 호출 예외: {e}"
-        time.sleep(1)
 
-return last_err or "Gemini 호출 실패"
+    return last_err or "Gemini 호출 실패"
 
-        if resp.status_code != 200:
-            return f"Gemini 호출 오류: {resp.status_code} / {resp.text}"
-        data = resp.json()
-        # 응답에서 텍스트 추출
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return "Gemini 응답이 비어 있습니다."
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text = "".join([p.get("text", "") for p in parts])
-        return text.strip() if text.strip() else "Gemini 응답 텍스트가 비어 있습니다."
-    except Exception as e:
-        return f"Gemini 호출 예외: {e}"
 
 # -------------------------
 # 보고서 HTML 생성
