@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 # 설정
 # -------------------------
 NAVER_NEWS_URL = "https://openapi.naver.com/v1/search/news.json"
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 st.set_page_config(page_title="언어와 매체: 기사 분석 도구", layout="wide")
 st.title("📰 언어와 매체 수행평가: 기사 수집 · 분석 (Naver News API)")
@@ -64,9 +64,9 @@ def naver_api_headers():
         st.stop()
     return {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": csec}
 
-def get_gemini_key_and_model():
-    api_key = st.secrets.get("GEMINI_API_KEY", "")
-    model = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+def get_openai_key_and_model():
+    api_key = st.secrets.get("OPENAI_API_KEY", "")
+    model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
     return api_key, model
 
 def dedup_articles(df: pd.DataFrame) -> pd.DataFrame:
@@ -130,78 +130,95 @@ def fetch_news_one_keyword(keyword: str, start_d: date, end_d: date, target_n: i
     return pd.DataFrame(rows)
 
 # -------------------------
-# Gemini 분석 (대시보드 해석)
+# OpenAI 분석 (대시보드 해석) - Responses API
 # -------------------------
-def gemini_analyze_dashboard(stats_text: str) -> str:
-    api_key, model = get_gemini_key_and_model()
-    if not api_key:
-        return "GEMINI_API_KEY가 설정되지 않았습니다. (Secrets 확인)"
+def _extract_responses_text(data: dict) -> str:
+    """
+    Responses API 응답에서 텍스트를 최대한 안전하게 추출
+    """
+    # 문서에 따라 output_text가 제공되는 경우가 있음
+    if isinstance(data, dict) and data.get("output_text"):
+        return str(data["output_text"]).strip()
 
-    url = f"{GEMINI_BASE}/{model}:generateContent?key={api_key}"
+    out_chunks = []
+    for item in data.get("output", []) if isinstance(data, dict) else []:
+        for c in item.get("content", []):
+            if c.get("type") == "output_text":
+                out_chunks.append(c.get("text", ""))
+            # 일부 형식에서는 type이 text일 수도 있어 방어
+            if c.get("type") == "text":
+                out_chunks.append(c.get("text", ""))
+
+    text = "".join(out_chunks).strip()
+    return text
+
+def openai_analyze_dashboard(stats_text: str) -> str:
+    api_key, model = get_openai_key_and_model()
+    if not api_key:
+        return "OPENAI_API_KEY가 설정되지 않았습니다. (Secrets 확인)"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
     prompt = f"""
 너는 고3 ‘언어와 매체’ 수행평가 조교다.
-아래 <통계 요약>의 숫자/사실만 사용해 분석해라. 통계에 없는 내용(추정, 일반론, 외부지식)은 금지.
-반드시 아래 형식을 지켜라:
-[1] 핵심 관찰(3~5개): 각 문장에 수치 1개 이상 포함
-[2] 프레임 해석(2~3개): 책임귀인/갈등/경제/해결/공포/데이터 중 무엇이 보이는지, 통계 수치와 연결
-[3] 추가 탐구 질문(3개): 기사 본문 확인이 필요하게
+
+규칙(매우 중요):
+- 아래 <통계 요약>에 있는 숫자/사실만 사용한다.
+- 통계에 없는 내용(추정, 일반론, 외부지식)은 금지.
+- 각 주장 문장 끝에 반드시 (근거: 통계 요약의 어떤 항목인지) 한 줄로 표기한다.
+
+형식(반드시 지켜라):
+[1] 핵심 관찰(3~5개) : 각 문장에 수치 1개 이상 포함
+[2] 프레임 해석(2~3개) : 책임귀인/갈등/경제/해결/공포/데이터 중 무엇이 보이는지 + 수치 근거
+[3] 추가 탐구 질문(3개) : 기사 본문 확인이 필요한 질문만
 
 <통계 요약>
 {stats_text}
 """.strip()
 
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 900
-        }
+        "model": model,
+        # 최신 권장: Responses API input
+        "input": prompt,
+        "max_output_tokens": 900,
     }
 
     last_err = None
-    for _ in range(2):
+    for _ in range(2):  # 2회 재시도
         try:
-            resp = requests.post(url, json=payload, timeout=90)
+            resp = requests.post(OPENAI_RESPONSES_URL, headers=headers, json=payload, timeout=90)
+
             if resp.status_code != 200:
                 last_err = f"HTTP {resp.status_code}: {resp.text}"
                 time.sleep(1)
                 continue
 
             data = resp.json()
-
-            # 진단 정보
-            prompt_feedback = data.get("promptFeedback", {})
-            candidates = data.get("candidates", [])
-            if not candidates:
-                return f"Gemini candidates 없음. promptFeedback={prompt_feedback}"
-
-            c0 = candidates[0]
-            finish = c0.get("finishReason", "")
-            parts = c0.get("content", {}).get("parts", [])
-            text = "".join([p.get("text", "") for p in parts]).strip()
+            text = _extract_responses_text(data)
 
             if not text:
-                return f"Gemini 텍스트 비어있음. finishReason={finish}, promptFeedback={prompt_feedback}"
+                # 진단용 일부 필드 노출
+                return f"OpenAI 응답 텍스트가 비었습니다. raw_keys={list(data.keys())}"
 
-            # 너무 짧으면 진단 메시지 덧붙임
             if len(text) < 120:
-                text += f"\n\n⚠️ 응답이 짧습니다.\n- finishReason={finish}\n- promptFeedback={prompt_feedback}"
-
+                text += "\n\n⚠️ 응답이 매우 짧습니다. (모델 권한/쿼터/필터/네트워크 문제 가능)"
             return text
 
         except Exception as e:
             last_err = repr(e)
             time.sleep(1)
 
-    return f"Gemini 호출 실패: {last_err}"
-
-
+    return f"OpenAI 호출 실패: {last_err}"
 
 # -------------------------
 # 보고서 HTML 생성
 # -------------------------
-def build_report_html(df: pd.DataFrame, evidence: dict, start_d: date, end_d: date, student_id: str, student_name: str, reflection: str) -> str:
+def build_report_html(df: pd.DataFrame, evidence: dict, start_d: date, end_d: date,
+                      student_id: str, student_name: str, reflection: str,
+                      dashboard_ai_summary: str) -> str:
     valid_items = [(k, v) for k, v in evidence.items() if v.get("e1") and v.get("e2")]
 
     trs = []
@@ -239,7 +256,7 @@ def build_report_html(df: pd.DataFrame, evidence: dict, start_d: date, end_d: da
         "th{background:#f2f2f2;}"
         "h1{margin-bottom:6px;}"
         ".meta{color:#555; margin:8px 0 16px 0;}"
-        ".box{border:1px solid #ddd; padding:12px; background:#fafafa;}"
+        ".box{border:1px solid #ddd; padding:12px; background:#fafafa; white-space:pre-wrap;}"
         ".note{margin-top:14px; color:#333;}"
         "</style>"
         "</head><body>"
@@ -251,8 +268,13 @@ def build_report_html(df: pd.DataFrame, evidence: dict, start_d: date, end_d: da
         f"기사 수집 기간: {start_d} ~ {end_d}<br/>"
         f"수집 기사 수: {n_articles}"
         f"</div>"
+
+        "<h2>통계 대시보드 해석(AI)</h2>"
+        f"<div class='box'>{safe_text(dashboard_ai_summary)}</div>"
+
         "<h2>개인 생각(소감/비판적 관점)</h2>"
-        f"<div class='box'>{safe_text(reflection).replace('\\n','<br/>')}</div>"
+        f"<div class='box'>{safe_text(reflection)}</div>"
+
         "<h2 style='margin-top:18px;'>Claim–Evidence–Source 표</h2>"
         "<p>※ 각 항목은 학생이 입력한 ‘근거 문장’을 기반으로 구성됩니다.</p>"
         "<table>"
@@ -357,7 +379,7 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
             mime="text/csv",
         )
 
-    # ② 통계 + Gemini 해석
+    # ② 통계 + OpenAI 해석
     with tabs[1]:
         st.subheader("② 통계 대시보드")
 
@@ -379,12 +401,12 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
         st.plotly_chart(px.bar(hype_df, x="word", y="count", title="강조/선정 표현 빈도(제목 기준)"), use_container_width=True)
 
         st.divider()
-        st.subheader("④ (업그레이드) Gemini로 통계 해석 생성")
+        st.subheader("④ (업그레이드) OpenAI로 통계 해석 생성")
 
-        # 통계 요약 텍스트 만들기(모델에 “이것만” 주기)
         top_kw = by_kw.head(10).to_dict("records")
         peak = by_date.sort_values("count", ascending=False).head(1).to_dict("records")
         hype_top = hype_df.head(6).to_dict("records")
+
         stats_text = (
             f"- 기간: {start_d} ~ {end_d}\n"
             f"- 수집 기사 수: {len(df_local)}\n"
@@ -393,30 +415,28 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
             f"- 제목 강조어 빈도(상위): {hype_top}\n"
         )
 
-        with st.expander("Gemini에게 전달되는 통계 요약(검증용)"):
+        with st.expander("AI에게 전달되는 통계 요약(검증용)"):
             st.code(stats_text)
 
-    if st.button("Gemini로 통계 해석 생성", type="primary"):
-        st.session_state["gemini_dashboard_commentary"] = ""
-        st.session_state["gemini_error"] = ""
+        if "dashboard_ai" not in st.session_state:
+            st.session_state["dashboard_ai"] = ""
+        if "dashboard_ai_err" not in st.session_state:
+            st.session_state["dashboard_ai_err"] = ""
 
-        with st.spinner("Gemini가 통계 해석을 작성 중..."):
-            try:
-                result = gemini_analyze_dashboard(stats_text)
-                st.session_state["gemini_dashboard_commentary"] = result
-            except Exception as e:
-                st.session_state["gemini_error"] = f"Gemini 분석 중 예외: {repr(e)}"
+        if st.button("OpenAI로 통계 해석 생성", type="primary"):
+            st.session_state["dashboard_ai"] = ""
+            st.session_state["dashboard_ai_err"] = ""
+            with st.spinner("OpenAI가 통계 해석을 작성 중..."):
+                try:
+                    st.session_state["dashboard_ai"] = openai_analyze_dashboard(stats_text)
+                except Exception as e:
+                    st.session_state["dashboard_ai_err"] = f"OpenAI 분석 중 예외: {repr(e)}"
 
-    # ✅ 에러가 있으면 먼저 보여주기(원인 파악)
-    if st.session_state.get("gemini_error"):
-        st.error(st.session_state["gemini_error"])
+        if st.session_state.get("dashboard_ai_err"):
+            st.error(st.session_state["dashboard_ai_err"])
 
-    # ✅ 결과 표시
-    commentary = st.session_state.get("gemini_dashboard_commentary", "")
-    if commentary:
-        st.text_area("Gemini 해석 결과(전체)", value=commentary, height=420)
-
-        st.caption("※ 버튼 클릭 후 반응이 없으면, 잠시 아래로 스크롤해서 오류 문구가 있는지 확인하세요.")
+        if st.session_state.get("dashboard_ai"):
+            st.text_area("AI 해석 결과(전체)", value=st.session_state["dashboard_ai"], height=420)
 
     # ③ 근거 입력
     with tabs[2]:
@@ -465,11 +485,10 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
         valid = [k for k, v in st.session_state.evidence.items() if v.get("e1") and v.get("e2")]
         st.info(f"근거 2문장 입력 완료: {len(valid)}개 기사")
 
-    # ④ 보고서: 미리보기 + 학번/성명 + 개인생각 + 다운로드 조건
+    # ④ 보고서
     with tabs[3]:
         st.subheader("④ 보고서")
 
-        # 입력란(세션 저장)
         if "student_id" not in st.session_state:
             st.session_state["student_id"] = ""
         if "student_name" not in st.session_state:
@@ -495,10 +514,10 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
         min_required = 3
         st.write(f"근거 입력 완료 기사 수: **{len(valid_items)}개** / 필요: **{min_required}개**")
 
-        # 다운로드 가능 조건
         ok_evidence = len(valid_items) >= min_required
         ok_student = bool(st.session_state["student_id"].strip()) and bool(st.session_state["student_name"].strip())
         ok_reflection = bool(st.session_state["reflection"].strip())
+        ok_ai = bool(st.session_state.get("dashboard_ai", "").strip())
 
         if not ok_student:
             st.warning("학번/성명을 입력하세요.")
@@ -506,10 +525,11 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
             st.warning("개인 생각(소감)을 입력하세요.")
         if not ok_evidence:
             st.warning("③ 근거 입력에서 최소 3개 기사에 근거 문장 2개를 입력하고 저장하세요.")
+        if not ok_ai:
+            st.warning("② 통계 대시보드에서 ‘OpenAI 통계 해석’을 생성하면 보고서 완성도가 올라갑니다. (선택이지만 권장)")
 
         can_make = ok_student and ok_reflection and ok_evidence
 
-        # 미리보기 생성
         if can_make:
             html = build_report_html(
                 df=df,
@@ -518,7 +538,8 @@ if st.session_state.get("data_ready") and "df" in st.session_state:
                 end_d=end_d,
                 student_id=st.session_state["student_id"],
                 student_name=st.session_state["student_name"],
-                reflection=st.session_state["reflection"]
+                reflection=st.session_state["reflection"],
+                dashboard_ai_summary=st.session_state.get("dashboard_ai", "")
             )
 
             st.subheader("보고서 미리보기")
